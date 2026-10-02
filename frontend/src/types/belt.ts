@@ -18,6 +18,12 @@ export interface Belt {
   surveyDate: string
   /** 调查人 */
   observer: string
+  /**
+   * 乐观锁版本号：每次内容改动 +1。
+   * 样带布设页与珊瑚计数页分别编辑样带时，提交方带上自己看到的版本，
+   * 版本落后说明别人先改过，本次只指出冲突字段，不整条覆盖。
+   */
+  version: number
   createdAt: number
   updatedAt: number
 }

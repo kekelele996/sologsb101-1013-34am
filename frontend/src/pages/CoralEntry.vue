@@ -5,10 +5,10 @@
  * 支持批量粘贴与批量改白化等级，深链访问时样带不存在给出友好空态。
  * 复用 <BleachTag>、<StatBadge>。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, DocumentCopy, Edit, Plus } from '@element-plus/icons-vue'
+import { Delete, DocumentCopy, Edit, Plus, WarningFilled } from '@element-plus/icons-vue'
 import BleachTag from '@/components/common/BleachTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
@@ -25,6 +25,7 @@ import {
 import type { BleachLevel, CoralForm, CoralRecord } from '@/types/coralRecord'
 import { BLEACH_BG, BLEACH_COLOR, bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, groupByForm, groupByGenus } from '@/utils/bleach'
 import { initDatabase } from '@/utils/db'
+import { conflictFieldLabel } from '@/utils/versioning'
 
 const route = useRoute()
 const router = useRouter()
@@ -44,6 +45,10 @@ const pasteVisible = ref(false)
 const pasteText = ref('')
 const pasteErrors = ref<string[]>([])
 const selectedIds = ref<string[]>([])
+/** 打开编辑时看到的版本号，提交时原样报给库做乐观锁比对 */
+const baseVersion = ref(1)
+type CoralBaseSnapshot = Pick<CoralRecord, 'genus' | 'form' | 'coverCm' | 'bleachLevel' | 'remark'>
+const baseSnapshot = ref<CoralBaseSnapshot | null>(null)
 const form = reactive({
   genus: '',
   form: '枝状' as CoralForm,
@@ -53,6 +58,34 @@ const form = reactive({
 })
 
 const records = computed(() => surveyStore.coralsOfBelt(beltId.value))
+
+/** 超出当前样带长度、需要重新核对的珊瑚记录 */
+const reviewRecords = computed(() => {
+  const limitCm = belt.value ? belt.value.lengthM * 100 : Number.POSITIVE_INFINITY
+  return records.value.filter((record) => record.needsReview || record.coverCm > limitCm)
+})
+
+/**
+ * 样带布设页改了长度 / 朝向（版本号变化）时，本页提示覆盖度已重算。
+ * liveQuery 会把新版本推到 store，这里仅在「同一 id、版本号变了」时点名。
+ */
+watch(
+  () => belt.value,
+  (next, prev) => {
+    if (!next || !prev || next.id !== prev.id || next.version === prev.version) return
+    const changed: string[] = []
+    if (next.lengthM !== prev.lengthM) {
+      changed.push(`长度 ${prev.lengthM} m → ${next.lengthM} m，覆盖率已按新长度重算`)
+    }
+    if (next.orientation !== prev.orientation) changed.push(`朝向 ${prev.orientation} → ${next.orientation}`)
+    if (changed.length > 0) {
+      ElMessage.warning({
+        message: `样带 ${next.no} 已被布设页更新（v${prev.version} → v${next.version}）：${changed.join('；')}`,
+        duration: 6000
+      })
+    }
+  }
+)
 
 /** 按属名分组汇总 */
 const genusGroups = computed(() =>
@@ -98,8 +131,21 @@ function barPercent(value: number, total: number): string {
   return `${Math.min(100, (value / total) * 100).toFixed(1)}%`
 }
 
+function captureBase(record: CoralRecord): void {
+  baseVersion.value = record.version
+  baseSnapshot.value = {
+    genus: record.genus,
+    form: record.form,
+    coverCm: record.coverCm,
+    bleachLevel: record.bleachLevel,
+    remark: record.remark
+  }
+}
+
 function openCreate(): void {
   editingId.value = null
+  baseVersion.value = 1
+  baseSnapshot.value = null
   form.genus = ''
   form.form = '枝状'
   form.coverCm = 100
@@ -115,6 +161,7 @@ function openEdit(record: CoralRecord): void {
   form.coverCm = record.coverCm
   form.bleachLevel = record.bleachLevel
   form.remark = record.remark
+  captureBase(record)
   dialogVisible.value = true
 }
 
@@ -141,16 +188,71 @@ async function submitForm(): Promise<void> {
       remark: form.remark.trim()
     }
     if (editingId.value) {
-      await surveyStore.updateCoral(editingId.value, payload)
-      ElMessage.success('珊瑚记录已更新')
+      const outcome = await surveyStore.saveCoralVersioned(
+        editingId.value,
+        baseVersion.value,
+        baseSnapshot.value ?? {},
+        payload
+      )
+      if (outcome.status === 'not-found' || !outcome.record) {
+        ElMessage.error('该珊瑚记录已被删除，无法保存')
+        dialogVisible.value = false
+        return
+      }
+      if (outcome.status === 'conflict') {
+        // 别人先动过同一行：只指出已被更新的字段，不整条盖回去
+        const detail = outcome.conflicts
+          .map(
+            (item) =>
+              `「${conflictFieldLabel(item.key)}」对方已改为 ${String(item.current)}，你填的是 ${String(item.wanted)}`
+          )
+          .join('；')
+        try {
+          await ElMessageBox.alert(
+            `「${outcome.record.genus}（${outcome.record.form}）」已被另一处先更新（当前版本 v${outcome.record.version}，你打开时为 v${baseVersion.value}）：${detail}。本次未保存，请点「读取最新」在对方数据上重新编辑。`,
+            '存在更新冲突，未覆盖',
+            { type: 'warning', confirmButtonText: '读取最新', cancelButtonText: '留在本页', showCancelButton: true }
+          )
+          captureBase(outcome.record)
+          form.genus = outcome.record.genus
+          form.form = outcome.record.form
+          form.coverCm = outcome.record.coverCm
+          form.bleachLevel = outcome.record.bleachLevel
+          form.remark = outcome.record.remark
+        } catch {
+          // 留在本页继续修改，不覆盖
+        }
+        return
+      }
+      if (outcome.status === 'noop') {
+        ElMessage.info('内容无变化，未保存')
+        dialogVisible.value = false
+        return
+      }
+      dialogVisible.value = false
+      if (outcome.reviewCleared) {
+        ElMessage.success('珊瑚记录已更新，覆盖长度已回到样带长度以内，待重核标记已清除')
+      } else {
+        ElMessage.success(
+          outcome.status === 'merged'
+            ? '珊瑚记录已更新（检测到对方先改了其他字段，已自动合并）'
+            : '珊瑚记录已更新'
+        )
+      }
     } else {
       await surveyStore.createCoral(beltId.value, payload)
       ElMessage.success('珊瑚记录已新增，覆盖率与白化占比已重算')
+      dialogVisible.value = false
     }
-    dialogVisible.value = false
   } finally {
     submitting.value = false
   }
+}
+
+/** 人工核对完成，清除该行待重核标记 */
+async function dismissReview(record: CoralRecord): Promise<void> {
+  await surveyStore.clearCoralReviewFlag(record.id)
+  ElMessage.success(`「${record.genus}（${record.form}）」已标记为核对完成`)
 }
 
 async function removeRecord(record: CoralRecord): Promise<void> {
@@ -219,9 +321,13 @@ async function importPaste(): Promise<void> {
   } catch {
     return
   }
-  const count = await surveyStore.importCoralRows(beltId.value, parsed.rows)
+  const result = await surveyStore.importCoralRows(beltId.value, parsed.rows)
   pasteVisible.value = false
-  ElMessage.success(`已导入 ${count} 条珊瑚记录`)
+  if (result.flagged > 0) {
+    ElMessage.warning(`已导入 ${result.count} 条珊瑚记录，其中 ${result.flagged} 条覆盖长度超出样带长度，已标「待重核」`)
+  } else {
+    ElMessage.success(`已导入 ${result.count} 条珊瑚记录`)
+  }
 }
 
 function gotoFishes(): void {
@@ -269,6 +375,7 @@ onMounted(() => {
             <el-tag size="small" effect="plain">{{ belt.orientation }}向</el-tag>
             <el-tag size="small" type="info" effect="plain">长 {{ belt.lengthM }} m</el-tag>
             <el-tag size="small" type="info" effect="plain">{{ belt.surveyDate }}</el-tag>
+            <el-tag size="small" type="info" effect="plain">样带版本 v{{ belt.version }}</el-tag>
           </h2>
           <p class="gb-hint">
             按属名与形态逐条录入覆盖长度与白化等级；覆盖率 = 覆盖长度合计 / 样带长度，白化指数按覆盖长度加权。
@@ -294,6 +401,30 @@ onMounted(() => {
         />
         <StatBadge label="白化占比" :value="stats.bleachedSharePct" suffix="%" tone="warning" icon="TrendCharts" />
       </div>
+
+      <el-alert
+        v-if="reviewRecords.length > 0"
+        type="warning"
+        show-icon
+        :closable="false"
+        :icon="WarningFilled"
+        class="page__review-alert"
+        :title="`有 ${reviewRecords.length} 条珊瑚记录超出样带新长度（${belt.lengthM} m / ${belt.lengthM * 100} cm），覆盖率已按新长度重算，请逐条重新核对覆盖长度`"
+      >
+        <div class="page__review-list">
+          <el-tag
+            v-for="record in reviewRecords"
+            :key="`review-${record.id}`"
+            type="warning"
+            size="small"
+            effect="plain"
+            class="page__review-tag"
+          >
+            {{ record.genus }}（{{ record.form }}）{{ record.coverCm }} cm
+            <span v-if="record.reviewReason" class="page__review-reason">— {{ record.reviewReason }}</span>
+          </el-tag>
+        </div>
+      </el-alert>
 
       <el-card v-if="records.length > 0" shadow="never" class="gb-panel">
         <div class="gb-panel-title">
@@ -373,11 +504,16 @@ onMounted(() => {
             <el-checkbox :model-value="selectedIds.includes(row.id)" @change="() => toggleSelect(row.id)" />
           </template>
         </el-table-column>
-        <el-table-column prop="genus" label="属名" min-width="140" />
-        <el-table-column prop="form" label="形态" width="100" />
-        <el-table-column label="覆盖长度 (cm)" width="140" align="right">
+        <el-table-column prop="genus" label="属名" min-width="140">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.coverCm }}</span>
+            <span>{{ row.genus }}</span>
+            <el-tag v-if="row.needsReview" size="small" type="warning" effect="dark" class="page__row-flag">待重核</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="form" label="形态" width="100" />
+        <el-table-column label="覆盖长度 (cm)" width="150" align="right">
+          <template #default="{ row }">
+            <span :class="{ 'page__over-limit': row.coverCm > belt.lengthM * 100 }" class="gb-mono">{{ row.coverCm }}</span>
             <div class="gb-hint gb-mono">
               占样带 {{ belt.lengthM > 0 ? ((row.coverCm / (belt.lengthM * 100)) * 100).toFixed(1) : '0.0' }}%
             </div>
@@ -388,10 +524,21 @@ onMounted(() => {
             <BleachTag :level="row.bleachLevel" size="small" :plain="true" />
           </template>
         </el-table-column>
-        <el-table-column prop="remark" label="备注" min-width="160" show-overflow-tooltip />
-        <el-table-column label="操作" width="170" fixed="right">
+        <el-table-column prop="remark" label="备注" min-width="160" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span>{{ row.remark }}</span>
+            <div v-if="row.needsReview && row.reviewReason" class="page__review-reason">{{ row.reviewReason }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="版本" width="70" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" type="info" effect="plain">v{{ row.version }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="230" fixed="right">
           <template #default="{ row }">
             <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
+            <el-button v-if="row.needsReview" size="small" type="warning" plain @click="dismissReview(row)">已核对</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeRecord(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -447,6 +594,9 @@ onMounted(() => {
         </el-form-item>
       </el-form>
       <template #footer>
+        <span v-if="editingId" class="page__version-hint">
+          你打开时为版本 v{{ baseVersion }}，保存时若被对方先更新将只提示冲突、不覆盖
+        </span>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" @click="submitForm">
           {{ editingId ? '保存修改' : '新增记录' }}
@@ -551,5 +701,44 @@ onMounted(() => {
   margin-top: 10px;
   max-height: 160px;
   overflow: auto;
+}
+
+.page__review-alert {
+  align-items: flex-start;
+}
+
+.page__review-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.page__review-tag {
+  height: auto;
+  padding: 2px 8px;
+  white-space: normal;
+}
+
+.page__review-reason {
+  margin-left: 2px;
+  font-weight: normal;
+  opacity: 0.85;
+}
+
+.page__row-flag {
+  margin-left: 6px;
+}
+
+.page__over-limit {
+  color: #c4561b;
+  font-weight: 600;
+}
+
+.page__version-hint {
+  float: left;
+  padding-top: 8px;
+  font-size: 12px;
+  color: #7c9995;
 }
 </style>

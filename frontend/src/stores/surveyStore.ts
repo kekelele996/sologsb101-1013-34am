@@ -6,7 +6,12 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
 import type { BleachLevel, CoralForm, CoralRecord } from '@/types/coralRecord'
-import { BLEACH_LEVELS } from '@/types/coralRecord'
+import { BLEACH_LEVELS, INITIAL_RECORD_VERSION, LENGTH_REVIEW_PREFIX } from '@/types/coralRecord'
+import {
+  resolveVersionedWrite,
+  type VersionConflictField,
+  type VersionedSaveStatus
+} from '@/utils/versioning'
 import type { CountCategory, FishCount, SizeClass } from '@/types/fishCount'
 import type { Reef } from '@/types/reef'
 import type { Site } from '@/types/site'
@@ -254,56 +259,156 @@ export const useSurveyStore = defineStore('survey', () => {
 
   /* ------------------------------ 珊瑚记录 ------------------------------ */
 
+  type CoralEditable = Pick<CoralRecord, 'genus' | 'form' | 'coverCm' | 'bleachLevel' | 'remark'>
+  type CoralPatch = Partial<CoralEditable>
+
   async function createCoral(
     beltId: string,
-    payload: Omit<CoralRecord, 'id' | 'createdAt' | 'updatedAt' | 'beltId'>
+    payload: Omit<
+      CoralRecord,
+      'id' | 'createdAt' | 'updatedAt' | 'beltId' | 'version' | 'needsReview' | 'reviewReason'
+    >
   ): Promise<CoralRecord> {
     const now = Date.now()
-    const row: CoralRecord = { ...payload, beltId, id: createId('cor'), createdAt: now, updatedAt: now }
+    const row: CoralRecord = {
+      ...payload,
+      beltId,
+      version: INITIAL_RECORD_VERSION,
+      needsReview: false,
+      reviewReason: '',
+      id: createId('cor'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.corals.put(row)
     return row
   }
 
+  /** 无版本校验的字段更新（保留兼容入口；带并发控制的编辑请用 saveCoralVersioned） */
   async function updateCoral(id: string, patch: Partial<CoralRecord>): Promise<void> {
-    await db.corals.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const current = await db.corals.get(id)
+    if (!current) return
+    await db.corals.put({
+      ...current,
+      ...patch,
+      version: (current.version ?? INITIAL_RECORD_VERSION) + 1,
+      updatedAt: Date.now()
+    })
+  }
+
+  /**
+   * 带版本号保存珊瑚记录：提交方报告自己看到的版本（expectedVersion）。
+   * 别人先改过同一行且字段重叠 → status='conflict'，只指出冲突行与字段，不覆盖。
+   * 保存时覆盖长度若已回到样带长度以内，自动清除「长度变更」类待重核标记。
+   */
+  async function saveCoralVersioned(
+    id: string,
+    expectedVersion: number,
+    base: CoralPatch,
+    patch: CoralPatch
+  ): Promise<{
+    status: VersionedSaveStatus
+    conflicts: Array<VersionConflictField<keyof CoralEditable>>
+    mergedFields: Array<keyof CoralEditable>
+    reviewCleared: boolean
+    record: CoralRecord | undefined
+  }> {
+    let status: VersionedSaveStatus = 'not-found'
+    let conflicts: Array<VersionConflictField<keyof CoralEditable>> = []
+    let mergedFields: Array<keyof CoralEditable> = []
+    let reviewCleared = false
+    let record: CoralRecord | undefined
+    await db.transaction('rw', [db.corals, db.belts], async () => {
+      const current = await db.corals.get(id)
+      if (!current) return
+      const belt = await db.belts.get(current.beltId)
+      const resolved = resolveVersionedWrite<CoralRecord, keyof CoralEditable>(
+        current,
+        base as Record<string, unknown>,
+        expectedVersion,
+        patch as Record<string, unknown>,
+        () => {
+          current.updatedAt = Date.now()
+        }
+      )
+      if (resolved.status === 'ok' || resolved.status === 'merged') {
+        // 覆盖长度重新落入样带长度以内 → 清除长度变更类待重核标记
+        const limitCm = belt ? belt.lengthM * 100 : Number.POSITIVE_INFINITY
+        if (
+          current.needsReview &&
+          current.reviewReason.startsWith(LENGTH_REVIEW_PREFIX) &&
+          current.coverCm <= limitCm
+        ) {
+          current.needsReview = false
+          current.reviewReason = ''
+          reviewCleared = true
+        }
+        await db.corals.put(current)
+      }
+      status = resolved.status
+      conflicts = resolved.conflicts
+      mergedFields = resolved.mergedFields
+      record = resolved.record
+    })
+    return { status, conflicts, mergedFields, reviewCleared, record }
+  }
+
+  /** 人工重核后主动清除待重核标记（不改内容也不升版本） */
+  async function clearCoralReviewFlag(id: string): Promise<void> {
+    await db.corals.update(id, { needsReview: false, reviewReason: '' })
   }
 
   async function removeCoral(id: string): Promise<void> {
     await db.corals.delete(id)
   }
 
-  /** 批量导入粘贴行（替换该样带原有珊瑚记录） */
+  /** 批量导入粘贴行（替换该样带原有珊瑚记录）；超出样带长度的行置待重核 */
   async function importCoralRows(
     beltId: string,
     rows: Array<{ genus: string; form: CoralForm; coverCm: number; bleachLevel: BleachLevel }>
-  ): Promise<number> {
+  ): Promise<{ count: number; flagged: number }> {
     const now = Date.now()
-    const records: CoralRecord[] = rows.map((row, index) => ({
-      id: createId('cor'),
-      beltId,
-      genus: row.genus,
-      form: row.form,
-      coverCm: row.coverCm,
-      bleachLevel: row.bleachLevel,
-      remark: '',
-      createdAt: now + index,
-      updatedAt: now + index
-    }))
+    const belt = belts.value.find((item) => item.id === beltId) ?? (await db.belts.get(beltId))
+    const limitCm = belt ? belt.lengthM * 100 : Number.POSITIVE_INFINITY
+    let flagged = 0
+    const records: CoralRecord[] = rows.map((row, index) => {
+      const overLimit = row.coverCm > limitCm
+      if (overLimit) flagged += 1
+      return {
+        id: createId('cor'),
+        beltId,
+        genus: row.genus,
+        form: row.form,
+        coverCm: row.coverCm,
+        bleachLevel: row.bleachLevel,
+        remark: '',
+        version: INITIAL_RECORD_VERSION,
+        needsReview: overLimit,
+        reviewReason: overLimit
+          ? `${LENGTH_REVIEW_PREFIX}${belt?.lengthM ?? '?'} m，覆盖长度 ${row.coverCm} cm 超出样带长度，请重新核对`
+          : '',
+        createdAt: now + index,
+        updatedAt: now + index
+      }
+    })
     await db.transaction('rw', [db.corals], async () => {
       await db.corals.where('beltId').equals(beltId).delete()
       if (records.length > 0) await db.corals.bulkPut(records)
     })
-    return records.length
+    return { count: records.length, flagged }
   }
 
-  /** 批量改写白化等级 */
+  /** 批量改写白化等级；逐条内容改动，版本号 +1 */
   async function bulkSetBleachLevel(ids: string[], bleachLevel: BleachLevel): Promise<number> {
     const now = Date.now()
     await db.corals
       .where('id')
       .anyOf(ids)
       .modify((coral) => {
-        coral.bleachLevel = bleachLevel
+        if (coral.bleachLevel !== bleachLevel) {
+          coral.bleachLevel = bleachLevel
+          coral.version = (coral.version ?? INITIAL_RECORD_VERSION) + 1
+        }
         coral.updatedAt = now
       })
     return ids.length
@@ -398,6 +503,8 @@ export const useSurveyStore = defineStore('survey', () => {
     patchFishDraft,
     createCoral,
     updateCoral,
+    saveCoralVersioned,
+    clearCoralReviewFlag,
     removeCoral,
     importCoralRows,
     bulkSetBleachLevel,

@@ -11,9 +11,10 @@ import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
 import type { CoralRecord } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
+import { INITIAL_RECORD_VERSION } from '@/types/coralRecord'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbcoralbelt'
@@ -85,6 +86,33 @@ export class CoralBeltDatabase extends Dexie {
               Object.assign(row, factory())
             })
         }
+      })
+
+    // v3：样带与珊瑚记录加入乐观锁版本号；珊瑚记录加入待核对标记（needsReview 建索引便于筛选）。
+    // 库里已有数据没有版本号：升级时按初始版本 v1 回填，照常打开，不影响任何历史记录。
+    this.version(DB_VERSION)
+      .stores({
+        reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
+        sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
+        belts: 'id, siteId, no, lengthM, orientation, surveyDate, observer, version, updatedAt',
+        corals: 'id, beltId, genus, form, coverCm, bleachLevel, needsReview, version, updatedAt',
+        fishes: 'id, beltId, family, count, sizeClass, category, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('belts')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.version !== 'number') row.version = INITIAL_RECORD_VERSION
+          })
+        await tx
+          .table('corals')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.version !== 'number') row.version = INITIAL_RECORD_VERSION
+            if (typeof row.needsReview !== 'boolean') row.needsReview = false
+            if (typeof row.reviewReason !== 'string') row.reviewReason = ''
+          })
       })
   }
 }
@@ -327,12 +355,18 @@ export async function seedDemoData(): Promise<void> {
         const { corals, fishes, ...rest } = belt
         void corals
         void fishes
-        return { ...rest, ...stamp(200 + index) }
+        return { ...rest, version: INITIAL_RECORD_VERSION, ...stamp(200 + index) }
       })
     )
     await db.corals.bulkPut(
       belts.flatMap((belt, beltIndex) =>
-        belt.corals.map((coral, coralIndex) => ({ ...coral, ...stamp(300 + beltIndex * 100 + coralIndex) }))
+        belt.corals.map((coral, coralIndex) => ({
+          ...coral,
+          version: INITIAL_RECORD_VERSION,
+          needsReview: false,
+          reviewReason: '',
+          ...stamp(300 + beltIndex * 100 + coralIndex)
+        }))
       )
     )
     await db.fishes.bulkPut(

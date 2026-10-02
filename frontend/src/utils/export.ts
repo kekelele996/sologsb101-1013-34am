@@ -13,6 +13,7 @@ import {
 } from '@/utils/db'
 import {
   BLEACH_LEVELS,
+  INITIAL_RECORD_VERSION,
   type BleachLevel
 } from '@/types/coralRecord'
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
@@ -111,22 +112,36 @@ export function readFileText(file: File): Promise<string> {
   })
 }
 
+/** 导入前规范化：补齐 v3 新增的乐观锁版本与待核对字段，旧备份文件照常打开 */
+export function normalizeVersionedRows(payload: BackupPayload): BackupPayload {
+  const belts = payload.belts.map((belt) =>
+    typeof belt.version === 'number' ? belt : { ...belt, version: INITIAL_RECORD_VERSION }
+  )
+  const corals = payload.corals.map((coral) => ({
+    ...coral,
+    version: typeof coral.version === 'number' ? coral.version : INITIAL_RECORD_VERSION,
+    needsReview: typeof coral.needsReview === 'boolean' ? coral.needsReview : false,
+    reviewReason: typeof coral.reviewReason === 'string' ? coral.reviewReason : ''
+  }))
+  return { ...payload, belts, corals }
+}
+
 /** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
+  const normalized = normalizeVersionedRows(payload)
   if (overwrite) await clearAllTables()
   await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
-    await db.reefs.bulkPut(payload.reefs)
-    await db.sites.bulkPut(payload.sites)
-    await db.belts.bulkPut(payload.belts)
-    await db.corals.bulkPut(payload.corals)
-    await db.fishes.bulkPut(payload.fishes)
+    await db.reefs.bulkPut(normalized.reefs)
+    await db.sites.bulkPut(normalized.sites)
+    await db.belts.bulkPut(normalized.belts)
+    await db.corals.bulkPut(normalized.corals)
+    await db.fishes.bulkPut(normalized.fishes)
   })
-  return countPayload(payload)
+  return countPayload(normalized)
 }
 
 /** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案 */
-export function remapIds(payload: BackupPayload): BackupPayload {
-  const reefMap = new Map<string, string>()
+export function remapIds(payload: BackupPayload): BackupPayload {  const reefMap = new Map<string, string>()
   const siteMap = new Map<string, string>()
   const beltMap = new Map<string, string>()
 

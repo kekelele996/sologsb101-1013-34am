@@ -14,11 +14,13 @@ import BleachTag from '@/components/common/BleachTag.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { ORIENTATION_ORDER, useBeltStore } from '@/stores/beltStore'
+import type { BeltPatch } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
 import { BELT_LENGTH_PRESETS, ORIENTATIONS } from '@/types/belt'
 import type { Belt, Orientation } from '@/types/belt'
 import { bleachGrade, bleachIndex, coralCoveragePct, fishDensity } from '@/utils/bleach'
 import { initDatabase } from '@/utils/db'
+import { conflictFieldLabel } from '@/utils/versioning'
 
 const route = useRoute()
 const router = useRouter()
@@ -33,6 +35,10 @@ const reef = computed(() => (site.value ? reefStore.reefById(site.value.reefId) 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
 const submitting = ref(false)
+/** 打开编辑时看到的版本号，提交时原样报给库做乐观锁比对 */
+const baseVersion = ref(1)
+/** 打开编辑时看到的字段快照，用于判断对方先改了哪几个字段 */
+const baseSnapshot = ref<Required<BeltPatch> | null>(null)
 const form = reactive({
   no: '',
   lengthM: 50,
@@ -89,6 +95,8 @@ function nextNo(): string {
 
 function openCreate(): void {
   editingId.value = null
+  baseVersion.value = 1
+  baseSnapshot.value = null
   const existing = beltStore.beltsOfSite(siteId.value)
   form.no = nextNo()
   form.lengthM = existing[0]?.lengthM ?? 50
@@ -98,6 +106,18 @@ function openCreate(): void {
   dialogVisible.value = true
 }
 
+/** 记录打开编辑时看到的版本与字段快照，供提交时做乐观锁比对 */
+function captureBase(belt: Belt): void {
+  baseVersion.value = belt.version
+  baseSnapshot.value = {
+    no: belt.no,
+    lengthM: belt.lengthM,
+    orientation: belt.orientation,
+    surveyDate: belt.surveyDate,
+    observer: belt.observer
+  }
+}
+
 function openEdit(belt: Belt): void {
   editingId.value = belt.id
   form.no = belt.no
@@ -105,6 +125,7 @@ function openEdit(belt: Belt): void {
   form.orientation = belt.orientation
   form.surveyDate = belt.surveyDate
   form.observer = belt.observer
+  captureBase(belt)
   dialogVisible.value = true
 }
 
@@ -138,14 +159,74 @@ async function submitForm(): Promise<void> {
       observer: form.observer.trim()
     }
     if (editingId.value) {
-      await beltStore.updateBelt(editingId.value, payload)
-      ElMessage.success('样带已更新')
+      if (!baseSnapshot.value) {
+        const latest = beltStore.beltById(editingId.value)
+        if (latest) captureBase(latest)
+      }
+      const outcome = await beltStore.saveBeltVersioned(
+        editingId.value,
+        baseVersion.value,
+        baseSnapshot.value ?? {},
+        payload
+      )
+      if (outcome.status === 'not-found' || !outcome.belt) {
+        ElMessage.error('该样带已被删除，无法保存')
+        dialogVisible.value = false
+        return
+      }
+      if (outcome.status === 'conflict') {
+        // 别人先动过同一字段：只指出已被更新的行与字段，不把对方的长度 / 朝向盖回去
+        const detail = outcome.conflicts
+          .map(
+            (item) =>
+              `「${conflictFieldLabel(item.key)}」对方已改为 ${String(item.current)}，你填的是 ${String(item.wanted)}`
+          )
+          .join('；')
+        try {
+          await ElMessageBox.alert(
+            `样带 ${outcome.belt.no} 已被另一处先更新（当前版本 v${outcome.belt.version}，你打开时为 v${baseVersion.value}）：${detail}。本次未保存，请点「读取最新」在对方数据上重新编辑。`,
+            '存在更新冲突，未覆盖',
+            { type: 'warning', confirmButtonText: '读取最新', cancelButtonText: '留在本页', showCancelButton: true }
+          )
+          // 用户确认后用库里最新数据刷新表单与版本基线，重新编辑后再提交
+          captureBase(outcome.belt)
+          form.no = outcome.belt.no
+          form.lengthM = outcome.belt.lengthM
+          form.orientation = outcome.belt.orientation
+          form.surveyDate = outcome.belt.surveyDate
+          form.observer = outcome.belt.observer
+        } catch {
+          // 留在本页继续修改，不覆盖
+        }
+        return
+      }
+      if (outcome.status === 'noop') {
+        ElMessage.info('内容无变化，未保存')
+        dialogVisible.value = false
+        return
+      }
+      dialogVisible.value = false
+      if (outcome.flaggedCorals > 0) {
+        ElMessageBox.alert(
+          `样带长度已改为 ${payload.lengthM} m，覆盖率已按新长度重算；有 ${outcome.flaggedCorals} 条珊瑚记录覆盖长度超出新长度，请到珊瑚计数页重新核对（已标「待重核」）。`,
+          '覆盖度需重算 / 记录待重核',
+          { type: 'warning', confirmButtonText: '知道了' }
+        ).catch(() => {})
+      } else if (outcome.clearedCorals > 0) {
+        ElMessage.success(`样带已更新，${outcome.clearedCorals} 条记录已回到新长度以内，待重核标记已清除`)
+      } else {
+        ElMessage.success(
+          outcome.status === 'merged'
+            ? '样带已更新（检测到对方先改了其他字段，已自动合并）'
+            : '样带已更新'
+        )
+      }
     } else {
       const created = await beltStore.createBelt(siteId.value, payload)
       beltStore.selectBelt(created.id)
       ElMessage.success(`样带 ${created.no}（${created.orientation}向 ${created.lengthM} m）已布设，可录入底质与珊瑚计数`)
+      dialogVisible.value = false
     }
-    dialogVisible.value = false
   } finally {
     submitting.value = false
   }
@@ -281,6 +362,11 @@ onMounted(() => {
           </template>
         </el-table-column>
         <el-table-column prop="belt.observer" label="调查人" width="110" />
+        <el-table-column label="版本" width="80" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" type="info" effect="plain">v{{ row.belt.version }}</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="珊瑚记录" width="120" align="center">
           <template #default="{ row }">
             <el-button text type="primary" size="small" @click="gotoCorals(row.belt)">
@@ -355,6 +441,9 @@ onMounted(() => {
         </el-form-item>
       </el-form>
       <template #footer>
+        <span v-if="editingId" class="page__version-hint">
+          你打开时为版本 v{{ baseVersion }}，保存时若被对方先更新将只提示冲突、不覆盖
+        </span>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" @click="submitForm">
           {{ editingId ? '保存修改' : '布设并录入记录' }}
@@ -406,5 +495,12 @@ onMounted(() => {
   flex-wrap: wrap;
   gap: 2px;
   margin-top: 4px;
+}
+
+.page__version-hint {
+  float: left;
+  padding-top: 8px;
+  font-size: 12px;
+  color: #7c9995;
 }
 </style>

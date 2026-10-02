@@ -23,9 +23,25 @@ export interface CoralRecord {
   bleachLevel: BleachLevel
   /** 备注（病敌害、断枝等） */
   remark: string
+  /**
+   * 乐观锁版本号：每次内容改动 +1。
+   * 同一条珊瑚记录被两个人先后保存时，提交方带上自己看到的版本，
+   * 版本落后说明别人先改过，本次只指出冲突行，不整条覆盖。
+   */
+  version: number
+  /** 是否需要重新核对（样带长度缩短到覆盖长度以内时置 true） */
+  needsReview: boolean
+  /** 待核对原因，如「样带长度改为 40 m，覆盖长度超出新长度」 */
+  reviewReason: string
   createdAt: number
   updatedAt: number
 }
+
+/** 历史数据（v2 及更早）没有版本号，升级后统一按初始版本打开 */
+export const INITIAL_RECORD_VERSION = 1
+
+/** 待核对原因前缀（样带长度变化引起，覆盖长度重新落入新长度内时按此前缀清除） */
+export const LENGTH_REVIEW_PREFIX = '样带长度改为'
 
 /** 珊瑚记录草稿（存于 surveyStore） */
 export interface CoralDraft {

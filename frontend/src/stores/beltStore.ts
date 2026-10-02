@@ -7,6 +7,12 @@ import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
 import type { Belt, BeltDraft, Orientation } from '@/types/belt'
 import { ORIENTATIONS, createEmptyBeltDraft } from '@/types/belt'
+import { INITIAL_RECORD_VERSION, LENGTH_REVIEW_PREFIX } from '@/types/coralRecord'
+import {
+  resolveVersionedWrite,
+  type VersionConflictField,
+  type VersionedSaveStatus
+} from '@/utils/versioning'
 
 /** 朝向排序权重：北 → 东 → 南 → 西 */
 export const ORIENTATION_ORDER: Record<Orientation, number> = {
@@ -14,6 +20,22 @@ export const ORIENTATION_ORDER: Record<Orientation, number> = {
   东: 1,
   南: 2,
   西: 3
+}
+
+/** 样带可编辑字段（乐观锁冲突判定范围） */
+export type BeltEditable = Pick<Belt, 'no' | 'lengthM' | 'orientation' | 'surveyDate' | 'observer'>
+export type BeltPatch = Partial<BeltEditable>
+
+/** 乐观保存结果：含样带长度改动后触发的珊瑚记录重核情况 */
+export interface BeltSaveOutcome {
+  status: VersionedSaveStatus
+  conflicts: Array<VersionConflictField<keyof BeltEditable>>
+  mergedFields: Array<keyof BeltEditable>
+  /** 长度缩短后新标出的「超出新长度」珊瑚记录数 */
+  flaggedCorals: number
+  /** 长度放宽后清除重核标记的珊瑚记录数 */
+  clearedCorals: number
+  belt: Belt | undefined
 }
 
 export const useBeltStore = defineStore('belt', () => {
@@ -100,16 +122,97 @@ export const useBeltStore = defineStore('belt', () => {
 
   async function createBelt(
     siteId: string,
-    payload: Omit<Belt, 'id' | 'createdAt' | 'updatedAt' | 'siteId'>
+    payload: Omit<Belt, 'id' | 'createdAt' | 'updatedAt' | 'siteId' | 'version'>
   ): Promise<Belt> {
     const now = Date.now()
-    const row: Belt = { ...payload, siteId, id: createId('belt'), createdAt: now, updatedAt: now }
+    const row: Belt = {
+      ...payload,
+      siteId,
+      version: INITIAL_RECORD_VERSION,
+      id: createId('belt'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.belts.put(row)
     return row
   }
 
+  /** 无版本校验的字段更新（保留兼容入口；带并发控制的编辑请用 saveBeltVersioned） */
   async function updateBelt(id: string, patch: Partial<Belt>): Promise<void> {
-    await db.belts.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const current = await db.belts.get(id)
+    if (!current) return
+    await db.belts.put({
+      ...current,
+      ...patch,
+      version: (current.version ?? INITIAL_RECORD_VERSION) + 1,
+      updatedAt: Date.now()
+    })
+  }
+
+  /**
+   * 带版本号保存样带：提交方报告自己看到的版本（expectedVersion）。
+   * 别人先改过且字段重叠 → status='conflict'，只指出冲突字段，不写入任何内容；
+   * 互不重叠的改动自动合并。长度一旦改动，覆盖度随后按新长度重算，
+   * 超出新长度的珊瑚记录置「待重核」，放宽到覆盖长度以内的记录清除标记。
+   */
+  async function saveBeltVersioned(
+    id: string,
+    expectedVersion: number,
+    base: BeltPatch,
+    patch: BeltPatch
+  ): Promise<BeltSaveOutcome> {
+    let outcome: BeltSaveOutcome = {
+      status: 'not-found',
+      conflicts: [],
+      mergedFields: [],
+      flaggedCorals: 0,
+      clearedCorals: 0,
+      belt: undefined
+    }
+    await db.transaction('rw', [db.belts, db.corals], async () => {
+      const current = await db.belts.get(id)
+      if (!current) return
+      const now = Date.now()
+      const resolved = resolveVersionedWrite<Belt, keyof BeltEditable>(
+        current,
+        base as Record<string, unknown>,
+        expectedVersion,
+        patch as Record<string, unknown>,
+        () => {
+          current.updatedAt = now
+        }
+      )
+      let flaggedCorals = 0
+      let clearedCorals = 0
+      if (
+        (resolved.status === 'ok' || resolved.status === 'merged') &&
+        typeof patch.lengthM === 'number' &&
+        patch.lengthM !== base.lengthM
+      ) {
+        const newLengthCm = patch.lengthM * 100
+        const affected = await db.corals.where('beltId').equals(id).toArray()
+        for (const coral of affected) {
+          if (coral.coverCm > newLengthCm) {
+            if (!coral.needsReview) flaggedCorals += 1
+            const reason = `${LENGTH_REVIEW_PREFIX}${patch.lengthM} m，覆盖长度 ${coral.coverCm} cm 超出新长度，请重新核对`
+            await db.corals.update(coral.id, { needsReview: true, reviewReason: reason })
+          } else if (coral.reviewReason.startsWith(LENGTH_REVIEW_PREFIX)) {
+            clearedCorals += 1
+            await db.corals.update(coral.id, { needsReview: false, reviewReason: '' })
+          }
+        }
+      }
+      if (resolved.status === 'ok' || resolved.status === 'merged') await db.belts.put(current)
+      outcome = {
+        status: resolved.status,
+        conflicts: resolved.conflicts,
+        mergedFields: resolved.mergedFields,
+        flaggedCorals,
+        clearedCorals,
+        belt: resolved.record
+      }
+    })
+    return outcome
   }
 
   /** 删除样带：级联删除其珊瑚记录与鱼类计数 */
@@ -122,14 +225,17 @@ export const useBeltStore = defineStore('belt', () => {
     if (currentBeltId.value === id) selectBelt(null)
   }
 
-  /** 批量改写朝向（同站位多条样带统一方向） */
+  /** 批量改写朝向（同站位多条样带统一方向）；逐条内容改动，版本号 +1 */
   async function bulkSetOrientation(ids: string[], orientation: Orientation): Promise<number> {
     const now = Date.now()
     await db.belts
       .where('id')
       .anyOf(ids)
       .modify((belt) => {
-        belt.orientation = orientation
+        if (belt.orientation !== orientation) {
+          belt.orientation = orientation
+          belt.version = (belt.version ?? INITIAL_RECORD_VERSION) + 1
+        }
         belt.updatedAt = now
       })
     return ids.length
@@ -152,6 +258,7 @@ export const useBeltStore = defineStore('belt', () => {
     beltById,
     createBelt,
     updateBelt,
+    saveBeltVersioned,
     removeBelt,
     bulkSetOrientation,
     orientations: ORIENTATIONS
