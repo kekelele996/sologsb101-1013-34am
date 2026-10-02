@@ -13,10 +13,11 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import BleachTag from '@/components/common/BleachTag.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
-import { ORIENTATION_ORDER, useBeltStore } from '@/stores/beltStore'
+import { ORIENTATION_ORDER, diffBeltFields, useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
-import { BELT_LENGTH_PRESETS, ORIENTATIONS } from '@/types/belt'
+import { BELT_LENGTH_PRESETS, ORIENTATIONS, normalizeVersion } from '@/types/belt'
 import type { Belt, Orientation } from '@/types/belt'
+import type { BeltFieldChange } from '@/stores/beltStore'
 import { bleachGrade, bleachIndex, coralCoveragePct, fishDensity } from '@/utils/bleach'
 import { initDatabase } from '@/utils/db'
 
@@ -39,6 +40,30 @@ const form = reactive({
   orientation: '北' as Orientation,
   surveyDate: new Date().toISOString().slice(0, 10),
   observer: ''
+})
+
+/** 编辑时打开的样带快照（含看到的版本号），提交时按它做乐观并发检查 */
+const editingSeen = ref<Belt | null>(null)
+/** 保存冲突时库中的最新行 */
+const conflictVisible = ref(false)
+const conflictServer = ref<Belt | null>(null)
+/** 冲突后只列出被他人更新过的字段（不整条盖回） */
+const conflictChanges = ref<BeltFieldChange[]>([])
+
+/** 编辑弹窗开着时，样带是否已被他人先改过（liveQuery 推送后实时可见） */
+const editingStale = computed(() => {
+  const seen = editingSeen.value
+  if (!seen || !dialogVisible.value) return false
+  const server = beltStore.beltById(seen.id)
+  return !!server && normalizeVersion(server.version) !== normalizeVersion(seen.version)
+})
+
+/** 弹窗打开期间实时拉到的「他人改动字段」 */
+const editingChanges = computed<BeltFieldChange[]>(() => {
+  const seen = editingSeen.value
+  if (!seen || !editingStale.value) return []
+  const server = beltStore.beltById(seen.id)
+  return server ? diffBeltFields(seen, server) : []
 })
 
 /** 样带行：回显珊瑚记录数、鱼类记录数、覆盖率与白化指数 */
@@ -100,12 +125,46 @@ function openCreate(): void {
 
 function openEdit(belt: Belt): void {
   editingId.value = belt.id
+  // 拍下打开时的快照（含版本号）：提交时据此做乐观并发检查
+  editingSeen.value = { ...belt }
   form.no = belt.no
   form.lengthM = belt.lengthM
   form.orientation = belt.orientation
   form.surveyDate = belt.surveyDate
   form.observer = belt.observer
+  conflictVisible.value = false
+  conflictServer.value = null
   dialogVisible.value = true
+}
+
+/** 采用对方已保存的最新值：刷新表单与看到的版本，不覆盖对方修改 */
+function adoptConflict(): void {
+  const server = conflictServer.value
+  if (!server) return
+  form.no = server.no
+  form.lengthM = server.lengthM
+  form.orientation = server.orientation
+  form.surveyDate = server.surveyDate
+  form.observer = server.observer
+  editingSeen.value = { ...server }
+  conflictVisible.value = false
+  conflictServer.value = null
+  conflictChanges.value = []
+  ElMessage.info('已采用对方更新后的值，可在核对后再次保存')
+}
+
+/** 保存成功后提示：长度变短会导致部分珊瑚记录超出新长度，需去珊瑚计数页重核 */
+function warnOverLengthAfterSave(belt: Belt): void {
+  const overLength = surveyStore
+    .coralsOfBelt(belt.id)
+    .filter((coral) => coral.coverCm > belt.lengthM * 100)
+  if (overLength.length > 0) {
+    ElMessageBox.alert(
+      `样带长度已改为 ${belt.lengthM} m，覆盖度已按新长度重算；有 ${overLength.length} 条珊瑚记录超出新长度（>${belt.lengthM * 100} cm），请到「珊瑚计数」页逐条重核覆盖长度。`,
+      '珊瑚记录需重核',
+      { type: 'warning', confirmButtonText: '知道了' }
+    )
+  }
 }
 
 async function submitForm(): Promise<void> {
@@ -137,15 +196,29 @@ async function submitForm(): Promise<void> {
       surveyDate: form.surveyDate,
       observer: form.observer.trim()
     }
-    if (editingId.value) {
-      await beltStore.updateBelt(editingId.value, payload)
+    if (editingId.value && editingSeen.value) {
+      // 提交时带上自己看到的版本：别人先动过则只返回被更新的字段，不整条盖回
+      const result = await beltStore.saveBeltWithVersion(editingId.value, payload, editingSeen.value)
+      if (result.status === 'conflict') {
+        conflictServer.value = result.server
+        conflictChanges.value = result.changes
+        conflictVisible.value = true
+        return
+      }
+      if (result.status === 'missing') {
+        ElMessage.warning('该样带已被他人删除')
+        dialogVisible.value = false
+        return
+      }
       ElMessage.success('样带已更新')
+      dialogVisible.value = false
+      warnOverLengthAfterSave(result.belt)
     } else {
       const created = await beltStore.createBelt(siteId.value, payload)
       beltStore.selectBelt(created.id)
       ElMessage.success(`样带 ${created.no}（${created.orientation}向 ${created.lengthM} m）已布设，可录入底质与珊瑚计数`)
+      dialogVisible.value = false
     }
-    dialogVisible.value = false
   } finally {
     submitting.value = false
   }
@@ -264,7 +337,12 @@ onMounted(() => {
       />
 
       <el-table v-else :data="rows" border stripe class="gb-table-compact">
-        <el-table-column prop="belt.no" label="样带编号" width="110" />
+        <el-table-column label="样带编号" width="110">
+          <template #default="{ row }">
+            {{ row.belt.no }}
+            <div class="gb-hint">v{{ normalizeVersion(row.belt.version) }}</div>
+          </template>
+        </el-table-column>
         <el-table-column label="朝向" width="90" align="center">
           <template #default="{ row }">
             <el-tag size="small" effect="plain">{{ row.belt.orientation }}</el-tag>
@@ -321,7 +399,33 @@ onMounted(() => {
       </el-table>
     </template>
 
-    <el-dialog v-model="dialogVisible" :title="editingId ? '编辑样带' : '布设样带'" width="540px" :close-on-click-modal="false">
+    <el-dialog v-model="dialogVisible" width="540px" :close-on-click-modal="false">
+      <template #title>
+        {{ editingId ? '编辑样带' : '布设样带' }}
+        <el-tag v-if="editingId && editingSeen" size="small" effect="plain" class="dialog__version-tag">
+          v{{ normalizeVersion(editingSeen.version) }}
+        </el-tag>
+      </template>
+      <el-alert
+        v-if="editingStale"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="dialog__stale"
+        title="该样带已被他人更新，继续保存可能覆盖对方刚填的内容"
+      >
+        <div class="stale-body">
+          <div v-for="change in editingChanges" :key="change.field" class="stale-row">
+            <span class="stale-field">{{ change.label }}</span>
+            <span class="stale-value">{{ change.from }}</span>
+            <span class="stale-arrow">→</span>
+            <span class="stale-value stale-value--to">{{ change.to }}</span>
+          </div>
+          <el-button size="small" type="primary" class="stale-adopt" @click="adoptConflict">
+            采用对方的值并刷新表单
+          </el-button>
+        </div>
+      </el-alert>
       <el-form label-width="104px">
         <el-form-item label="样带编号" required>
           <el-input v-model="form.no" placeholder="如：T-01" maxlength="24" />
@@ -359,6 +463,30 @@ onMounted(() => {
         <el-button type="primary" :loading="submitting" @click="submitForm">
           {{ editingId ? '保存修改' : '布设并录入记录' }}
         </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="conflictVisible" title="样带已被他人更新，未覆盖" width="520px" :close-on-click-modal="false">
+      <el-alert
+        type="warning"
+        show-icon
+        :closable="false"
+        title="提交时发现该样带的版本已领先于你打开时看到的版本，以下字段已被他人先改过"
+      />
+      <div class="conflict-list">
+        <div v-for="change in conflictChanges" :key="change.field" class="conflict-row">
+          <span class="conflict-field">{{ change.label }}</span>
+          <span class="conflict-from">{{ change.from }}</span>
+          <span class="conflict-arrow">→</span>
+          <span class="conflict-to">{{ change.to }}</span>
+        </div>
+      </div>
+      <p class="gb-hint">
+        为避免整条盖回，本次保存已中止并保留对方的修改。可采用对方的值刷新表单后再核对提交。
+      </p>
+      <template #footer>
+        <el-button @click="conflictVisible = false">关闭</el-button>
+        <el-button type="primary" @click="adoptConflict">采用对方的值并刷新表单</el-button>
       </template>
     </el-dialog>
   </section>
@@ -406,5 +534,86 @@ onMounted(() => {
   flex-wrap: wrap;
   gap: 2px;
   margin-top: 4px;
+}
+
+.dialog__version-tag {
+  margin-left: 8px;
+}
+
+.dialog__stale {
+  margin-bottom: 14px;
+}
+
+.stale-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.stale-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.stale-field {
+  min-width: 64px;
+  color: #4c6663;
+}
+
+.stale-value {
+  color: #7c9995;
+}
+
+.stale-value--to {
+  color: #b8821f;
+  font-weight: 600;
+}
+
+.stale-arrow {
+  color: #b0c4c1;
+}
+
+.stale-adopt {
+  align-self: flex-start;
+  margin-top: 6px;
+}
+
+.conflict-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.conflict-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #f7faf9;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.conflict-field {
+  min-width: 64px;
+  color: #4c6663;
+}
+
+.conflict-from {
+  color: #7c9995;
+  text-decoration: line-through;
+}
+
+.conflict-arrow {
+  color: #b0c4c1;
+}
+
+.conflict-to {
+  color: #b8821f;
+  font-weight: 600;
 }
 </style>

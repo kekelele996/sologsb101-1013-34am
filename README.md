@@ -32,7 +32,7 @@ docker compose up -d --build      # 修改代码后重新构建
 | 构建 | Vite 6 | 产物 `dist/`，交给 nginx 托管 |
 | 状态管理 | Pinia 2（setup store） | `reefStore` / `beltStore` / `surveyStore` |
 | 路由 | Vue Router 4（history 模式） | 路径与提示词逐字一致，支持深链刷新 |
-| 持久化 | Dexie 4（IndexedDB，库名 `gbcoralbelt`） | 结构版本 v2 + upgrade 迁移 + liveQuery 订阅 |
+| 持久化 | Dexie 4（IndexedDB，库名 `gbcoralbelt`） | 结构版本 v3 + upgrade 迁移 + liveQuery 订阅 + 样带乐观并发版本号 |
 | 容器 | node:20-alpine 构建 → nginx:alpine 运行 | 多阶段构建，运行阶段 `chmod -R a+rX` |
 
 ## 三、路由与功能模块
@@ -93,9 +93,11 @@ npm run preview    # 预览构建产物
 
 ## 六、数据存储说明
 
-- **存储位置**：浏览器 IndexedDB，库名 `gbcoralbelt`，当前结构版本 `v2`。读写统一经 `frontend/src/utils/db.ts` 封装，页面组件不直接触碰 Dexie 实例。
+- **存储位置**：浏览器 IndexedDB，库名 `gbcoralbelt`，当前结构版本 `v3`。读写统一经 `frontend/src/utils/db.ts` 封装，页面组件不直接触碰 Dexie 实例。
 - **数据表**：`reefs`（礁区）、`sites`（站位）、`belts`（样带）、`corals`（珊瑚记录）、`fishes`（鱼类与无脊椎动物计数）。
-- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2).stores(...).upgrade(...)` 补齐索引并回填历史数据缺失的时间戳与必填字段（面积、经纬度、水深、样带长度、覆盖长度、计数等）；调整字段结构时递增 `DB_VERSION` 并补迁移。
+- **升级迁移**：`db.version(1)` 保留初版结构；`db.version(2).stores(...).upgrade(...)` 补齐索引并回填历史数据缺失的时间戳与必填字段（面积、经纬度、水深、样带长度、覆盖长度、计数等）；`db.version(3).stores(...).upgrade(...)` 为全部历史行回填乐观并发版本号 `version = 1`（无版本号的旧数据照常打开、首次提交即补出版本号）；调整字段结构时递增 `DB_VERSION` 并补迁移。
+- **乐观并发**：样带布设页与珊瑚计数页可能同时打开同一条样带，`belts.version` 每次成功保存 +1。布设页提交时携带打开时看到的版本（`saveBeltWithVersion` 事务内读库比对）：版本一致才写入；库中版本已领先则返回冲突，只列出被他人更新过的字段（`diffBeltFields`：编号 / 长度 / 朝向 / 日期 / 调查人），不整条盖回，可「采用对方的值并刷新表单」。珊瑚计数页同样记录看到的样带版本，样带被改时提示并按新长度重算覆盖率。
+- **长度变更重核**：样带长度改短后，珊瑚计数页按新长度（`lengthM × 100` cm）重算覆盖率，超出新长度的珊瑚记录逐条红色提示「待重核」并可一键打开编辑；布设页保存后若发现超长记录也会弹窗提醒去珊瑚计数页重核。
 - **首屏播种**：`initDatabase()` 在 `reefs` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 个礁区 / 4 个站位 / 5 条样带 / 14 条珊瑚记录 / 12 条计数记录），覆盖「无 / 轻 / 中 / 重 / 死亡」全部白化等级，保证每个页面打开都有内容、层级路由也能命中真实 id。
 - **实时同步**：`utils/db.ts` 的 `watchTable()` 基于 Dexie `liveQuery` 订阅表变化，Pinia store 自动刷新，页面只读消费。
 - **算法口径**：珊瑚覆盖率 = 覆盖长度合计 / 样带长度 × 100%；白化指数 = 按覆盖长度加权的平均白化等级（无 0 / 轻 1 / 中 2 / 重 3 / 死亡 4，0 ~ 4），并按指数换算总体等级；鱼类密度 = 计数 / （样带长度 × 1 m）× 100（尾/100 m²）。

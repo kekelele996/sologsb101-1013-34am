@@ -111,15 +111,23 @@ export function readFileText(file: File): Promise<string> {
   })
 }
 
+/** 导入快照时补齐乐观并发版本号：无版本号的历史备份一律视为 v1，导入后照常打开与提交 */
+function withVersion<T>(rows: T[]): T[] {
+  return rows.map((row) => {
+    const version = Number((row as { version?: number }).version)
+    return { ...row, version: Number.isFinite(version) && version > 0 ? Math.floor(version) : 1 }
+  })
+}
+
 /** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
   if (overwrite) await clearAllTables()
   await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
-    await db.reefs.bulkPut(payload.reefs)
-    await db.sites.bulkPut(payload.sites)
-    await db.belts.bulkPut(payload.belts)
-    await db.corals.bulkPut(payload.corals)
-    await db.fishes.bulkPut(payload.fishes)
+    await db.reefs.bulkPut(withVersion(payload.reefs))
+    await db.sites.bulkPut(withVersion(payload.sites))
+    await db.belts.bulkPut(withVersion(payload.belts))
+    await db.corals.bulkPut(withVersion(payload.corals))
+    await db.fishes.bulkPut(withVersion(payload.fishes))
   })
   return countPayload(payload)
 }

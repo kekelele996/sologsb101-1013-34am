@@ -13,7 +13,7 @@ import type { CoralRecord } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbcoralbelt'
@@ -83,6 +83,29 @@ export class CoralBeltDatabase extends Dexie {
               if (typeof row.createdAt !== 'number') row.createdAt = now
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt
               Object.assign(row, factory())
+            })
+        }
+      })
+
+    // v3：补齐乐观并发版本号。样带布设页与珊瑚计数页可能同时打开同一条样带，
+    // 提交时按「自己看到的版本」做检查；历史行没有版本号，统一兜底为 1，升级后照常打开。
+    this.version(3)
+      .stores({
+        reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
+        sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
+        belts: 'id, siteId, no, lengthM, orientation, surveyDate, observer, updatedAt',
+        corals: 'id, beltId, genus, form, coverCm, bleachLevel, updatedAt',
+        fishes: 'id, beltId, family, count, sizeClass, category, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        for (const tableName of ['reefs', 'sites', 'belts', 'corals', 'fishes']) {
+          await tx
+            .table(tableName)
+            .toCollection()
+            .modify((row: Record<string, unknown>) => {
+              if (!Number.isFinite(row.version) || (row.version as number) <= 0) {
+                row.version = 1
+              }
             })
         }
       })
@@ -327,7 +350,7 @@ export async function seedDemoData(): Promise<void> {
         const { corals, fishes, ...rest } = belt
         void corals
         void fishes
-        return { ...rest, ...stamp(200 + index) }
+        return { ...rest, ...stamp(200 + index), version: 1 }
       })
     )
     await db.corals.bulkPut(

@@ -5,7 +5,7 @@
  * 支持批量粘贴与批量改白化等级，深链访问时样带不存在给出友好空态。
  * 复用 <BleachTag>、<StatBadge>。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, DocumentCopy, Edit, Plus } from '@element-plus/icons-vue'
@@ -14,7 +14,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
-import { useBeltStore } from '@/stores/beltStore'
+import { diffBeltFields, useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
 import {
   BLEACH_LEVELS,
@@ -23,6 +23,9 @@ import {
   parseCoralPaste
 } from '@/types/coralRecord'
 import type { BleachLevel, CoralForm, CoralRecord } from '@/types/coralRecord'
+import { normalizeVersion } from '@/types/belt'
+import type { Belt } from '@/types/belt'
+import type { BeltFieldChange } from '@/stores/beltStore'
 import { BLEACH_BG, BLEACH_COLOR, bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, groupByForm, groupByGenus } from '@/utils/bleach'
 import { initDatabase } from '@/utils/db'
 
@@ -36,6 +39,49 @@ const beltId = computed(() => String(route.params.id ?? ''))
 const belt = computed(() => beltStore.beltById(beltId.value))
 const site = computed(() => (belt.value ? reefStore.siteById(belt.value.siteId) : null))
 const reef = computed(() => (site.value ? reefStore.reefById(site.value.reefId) : null))
+
+/**
+ * 打开本页时看到的样带快照（含版本号）。
+ * 样带布设页与本页可能同时打开同一条样带：样带被对方更新时，
+ * 覆盖率按新长度重算，超出新长度的珊瑚记录逐条提示重核。
+ */
+const seenBelt = ref<Belt | null>(null)
+watch(
+  [beltId, () => beltStore.ready],
+  () => {
+    const current = beltStore.beltById(beltId.value)
+    seenBelt.value = current ? { ...current } : null
+  },
+  { immediate: true }
+)
+
+/** 样带是否已被他人更新（库中版本领先于本页看到的版本） */
+const beltChanged = computed(() => {
+  const seen = seenBelt.value
+  const current = belt.value
+  return (
+    !!seen &&
+    !!current &&
+    normalizeVersion(current.version) !== normalizeVersion(seen.version)
+  )
+})
+
+/** 样带被他人更新过的字段（只指出已被更新的行，不整条盖回） */
+const beltChanges = computed<BeltFieldChange[]>(() =>
+  seenBelt.value && belt.value ? diffBeltFields(seenBelt.value, belt.value) : []
+)
+
+/** 采用对方更新：刷新本页看到的样带版本（覆盖率已按新长度重算） */
+function adoptBeltChange(): void {
+  if (belt.value) seenBelt.value = { ...belt.value }
+}
+
+/** 超出当前样带长度的珊瑚记录：样带长度改短后，这些记录需逐条重核 */
+const overLengthRecords = computed<CoralRecord[]>(() => {
+  if (!belt.value) return []
+  const limitCm = belt.value.lengthM * 100
+  return records.value.filter((record) => record.coverCm > limitCm)
+})
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -130,6 +176,19 @@ async function submitForm(): Promise<void> {
   if (belt.value && form.coverCm > belt.value.lengthM * 100) {
     ElMessage.warning(`覆盖长度不应超过样带长度（${belt.value.lengthM * 100} cm）`)
     return
+  }
+  // 提交时报出自己看到的样带版本：若样带已被他人先改过，只指出被更新的字段，不整条盖回
+  if (beltChanged.value && belt.value && seenBelt.value) {
+    const changeText = beltChanges.value.map((change) => `${change.label}：${change.from} → ${change.to}`).join('；')
+    try {
+      await ElMessageBox.confirm(
+        `样带已被他人更新（本页看到 v${normalizeVersion(seenBelt.value.version)}，当前 v${normalizeVersion(belt.value.version)}）：${changeText}。覆盖率已按新长度重算，珊瑚记录本身不会被覆盖，是否继续保存本条记录？`,
+        '样带已被他人更新',
+        { type: 'warning', confirmButtonText: '继续保存珊瑚记录', cancelButtonText: '取消' }
+      )
+    } catch {
+      return
+    }
   }
   submitting.value = true
   try {
@@ -269,6 +328,9 @@ onMounted(() => {
             <el-tag size="small" effect="plain">{{ belt.orientation }}向</el-tag>
             <el-tag size="small" type="info" effect="plain">长 {{ belt.lengthM }} m</el-tag>
             <el-tag size="small" type="info" effect="plain">{{ belt.surveyDate }}</el-tag>
+            <el-tag size="small" :type="beltChanged ? 'warning' : 'info'" effect="plain">
+              v{{ normalizeVersion(belt.version) }}{{ beltChanged ? ' · 已被他人更新' : '' }}
+            </el-tag>
           </h2>
           <p class="gb-hint">
             按属名与形态逐条录入覆盖长度与白化等级；覆盖率 = 覆盖长度合计 / 样带长度，白化指数按覆盖长度加权。
@@ -294,6 +356,48 @@ onMounted(() => {
         />
         <StatBadge label="白化占比" :value="stats.bleachedSharePct" suffix="%" tone="warning" icon="TrendCharts" />
       </div>
+
+      <el-alert
+        v-if="beltChanged"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="gb-panel page__alert"
+        title="样带信息已被他人更新，覆盖率已按新长度重算"
+      >
+        <div class="stale-body">
+          <div v-for="change in beltChanges" :key="change.field" class="stale-row">
+            <span class="stale-field">{{ change.label }}</span>
+            <span class="stale-value">{{ change.from }}</span>
+            <span class="stale-arrow">→</span>
+            <span class="stale-value stale-value--to">{{ change.to }}</span>
+          </div>
+          <el-button size="small" type="primary" class="stale-adopt" @click="adoptBeltChange">
+            知道了，按新长度重算
+          </el-button>
+        </div>
+      </el-alert>
+
+      <el-alert
+        v-if="overLengthRecords.length > 0"
+        type="error"
+        show-icon
+        :closable="false"
+        class="gb-panel page__alert"
+        title="样带长度已变更，以下珊瑚记录超出新长度，请逐条重核"
+      >
+        <div class="stale-body">
+          <div v-for="record in overLengthRecords" :key="record.id" class="stale-row">
+            <span class="stale-field">{{ record.genus }}（{{ record.form }}）</span>
+            <span class="stale-value gb-mono">{{ record.coverCm }} cm</span>
+            <span class="stale-arrow">/</span>
+            <span class="stale-value">
+              新上限 <span class="gb-mono">{{ belt.lengthM * 100 }} cm</span>
+            </span>
+            <el-button size="small" type="primary" @click="openEdit(record)">去重核</el-button>
+          </div>
+        </div>
+      </el-alert>
 
       <el-card v-if="records.length > 0" shadow="never" class="gb-panel">
         <div class="gb-panel-title">
@@ -381,6 +485,15 @@ onMounted(() => {
             <div class="gb-hint gb-mono">
               占样带 {{ belt.lengthM > 0 ? ((row.coverCm / (belt.lengthM * 100)) * 100).toFixed(1) : '0.0' }}%
             </div>
+            <el-tag
+              v-if="row.coverCm > belt.lengthM * 100"
+              type="danger"
+              size="small"
+              effect="plain"
+              class="row-overlength"
+            >
+              超{{ belt.lengthM }}m · 待重核
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="白化等级" width="150">
@@ -551,5 +664,50 @@ onMounted(() => {
   margin-top: 10px;
   max-height: 160px;
   overflow: auto;
+}
+
+.page__alert {
+  margin-bottom: 0;
+}
+
+.stale-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.stale-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.stale-field {
+  min-width: 120px;
+  color: #4c6663;
+}
+
+.stale-value {
+  color: #7c9995;
+}
+
+.stale-value--to {
+  color: #b8821f;
+  font-weight: 600;
+}
+
+.stale-arrow {
+  color: #b0c4c1;
+}
+
+.stale-adopt {
+  align-self: flex-start;
+  margin-top: 6px;
+}
+
+.row-overlength {
+  margin-top: 2px;
 }
 </style>
